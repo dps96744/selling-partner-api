@@ -5,10 +5,14 @@ import requests
 import urllib.parse
 from flask import Flask, request, redirect
 
+# Your local DB helpers for storing tokens
 from db import create_sellers_table, store_refresh_token, get_refresh_token
+
+# SP-API library
 from sp_api.api import Sellers
 from sp_api.base import Marketplaces, SellingApiException
 
+# For AWS Secrets (LWA creds, etc.)
 import boto3
 from botocore.exceptions import ClientError
 
@@ -16,8 +20,8 @@ app = Flask(__name__)
 
 def get_spapi_secrets():
     """
-    Fetches SP-API LWA credentials from a secret named 'sp-api-credentials'.
-    The JSON might look like:
+    Fetches your SP-API LWA credentials from a secret named 'sp-api-credentials'.
+    JSON example:
     {
       "CLIENT_ID": "...",
       "CLIENT_SECRET": "...",
@@ -36,20 +40,16 @@ def get_spapi_secrets():
 @app.route("/start")
 def auth_start():
     """
-    1. Builds the Amazon OAuth consent URL
-    2. Redirects the seller to login & authorize your SP-API application
-    URL -> https://auth.cohortanalysis.ai/start
+    OAuth Login URI -> https://auth.cohortanalysis.ai/start
+    Builds the Amazon consent URL & redirects the seller to Amazon.
     """
     spapi_secrets = get_spapi_secrets()
     lwa_client_id = spapi_secrets['CLIENT_ID']
-    lwa_client_secret = spapi_secrets['CLIENT_SECRET']
-
-    # Typically we use the LWA client ID as the 'application_id' for SP-API OAuth
+    # We'll use the LWA client ID as 'application_id'
     application_id = lwa_client_id
-    state = "randomState123"
 
-    # The callback must match what's in Seller Central: "https://auth.cohortanalysis.ai/callback"
     redirect_uri = "https://auth.cohortanalysis.ai/callback"
+    state = "randomState123"
 
     base_url = "https://sellercentral.amazon.com/apps/authorize/consent"
     params = {
@@ -63,11 +63,8 @@ def auth_start():
 @app.route("/callback")
 def auth_callback():
     """
-    1. Amazon redirects here after the seller logs in & clicks "Authorize"
-    2. We get authorization_code
-    3. Exchange for refresh_token
-    4. Store refresh_token in the DB
-    URL -> https://auth.cohortanalysis.ai/callback
+    OAuth Redirect URI -> https://auth.cohortanalysis.ai/callback
+    Amazon sends the user here after authorization. We exchange the code for a refresh token.
     """
     spapi_secrets = get_spapi_secrets()
     lwa_client_id = spapi_secrets['CLIENT_ID']
@@ -100,7 +97,7 @@ def auth_callback():
     if not selling_partner_id:
         selling_partner_id = "UNKNOWN_PARTNER"
 
-    # Store the refresh token
+    # Store the refresh token in DB
     store_refresh_token(selling_partner_id, refresh_token)
 
     return f"Authorized seller {selling_partner_id}. You can close this window."
@@ -108,8 +105,8 @@ def auth_callback():
 @app.route("/test_sp_api")
 def test_sp_api():
     """
-    Example SP-API call using a seller's refresh token from DB.
-    GET https://auth.cohortanalysis.ai/test_sp_api?seller_id=XXX
+    Example endpoint -> https://auth.cohortanalysis.ai/test_sp_api?seller_id=XYZ
+    Uses the stored refresh token to call the SP-API for that seller.
     """
     spapi_secrets = get_spapi_secrets()
     lwa_client_id = spapi_secrets['CLIENT_ID']
@@ -141,17 +138,11 @@ def test_sp_api():
             "marketplace_participation": response.payload
         }
     except SellingApiException as exc:
-        return {
-            "error": str(exc)
-        }, 400
+        return {"error": str(exc)}, 400
 
 if __name__ == "__main__":
     create_sellers_table()
-    # If behind Nginx or ALB with SSL, you might use port=80 or port=5000, etc.
-    # For direct HTTP, open port 80 in EC2 security group, or if using 5000, do port=5000 and open that.
-    # Example:
-    app.run(host="0.0.0.0", port=80, debug=True)
-    # Then in your domain DNS, "auth.cohortanalysis.ai" -> EC2 IP,
-    # and in Seller Central: 
-    #   OAuth Login URI = https://auth.cohortanalysis.ai/start
-    #   OAuth Redirect URI = https://auth.cohortanalysis.ai/callback
+
+    # Use an unprivileged port (5000) so we don't need sudo.
+    # Open port 5000 in your EC2 Security Group if you want external access.
+    app.run(host="0.0.0.0", port=5000, debug=True)
