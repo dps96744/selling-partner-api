@@ -5,14 +5,11 @@ import requests
 import urllib.parse
 from flask import Flask, request, redirect
 
-# Your local DB helpers for storing tokens
 from db import create_sellers_table, store_refresh_token, get_refresh_token
 
-# SP-API library
 from sp_api.api import Sellers
 from sp_api.base import Marketplaces, SellingApiException
 
-# For AWS Secrets (LWA creds, etc.)
 import boto3
 from botocore.exceptions import ClientError
 
@@ -21,10 +18,9 @@ app = Flask(__name__)
 def get_spapi_secrets():
     """
     Fetches your SP-API LWA credentials from a secret named 'sp-api-credentials'.
-    JSON example:
     {
-      "CLIENT_ID": "...",
-      "CLIENT_SECRET": "...",
+      "CLIENT_ID": "...",          # LWA client ID (amzn1.application-oa2-client...)
+      "CLIENT_SECRET": "...",      # LWA client secret
       "AWS_ACCESS_KEY_ID": "...",
       "AWS_SECRET_ACCESS_KEY": "..."
     }
@@ -40,22 +36,28 @@ def get_spapi_secrets():
 @app.route("/start")
 def auth_start():
     """
-    OAuth Login URI -> https://auth.cohortanalysis.ai/start
+    OAuth Login URI -> http://<EC2-IP>:5000/start
     Builds the Amazon consent URL & redirects the seller to Amazon.
+
+    IMPORTANT: We add 'version=beta' to support a DRAFT app workflow.
+    Once your app is published, remove "version": "beta".
     """
     spapi_secrets = get_spapi_secrets()
-    lwa_client_id = spapi_secrets['CLIENT_ID']
-    # We'll use the LWA client ID as 'application_id'
-    application_id = lwa_client_id
 
+    # This is your SP-API "Solution ID"/"App ID" from Seller Central, something like:
+    # amzn1.sp.solution.d9a2df28-9c51-40d1-84b1-89daf7c4d0a4
+    spapi_solution_id = "amzn1.sp.solution.d9a2df28-9c51-40d1-84b1-89daf7c4d0a4"
+
+    # The redirect URI must match what's in your Developer Console.
     redirect_uri = "https://auth.cohortanalysis.ai/callback"
     state = "randomState123"
 
     base_url = "https://sellercentral.amazon.com/apps/authorize/consent"
     params = {
-        "application_id": application_id,
+        "application_id": spapi_solution_id,     # SP-API solution ID
         "redirect_uri": redirect_uri,
-        "state": state
+        "state": state,
+        "version": "beta"   # <-- The key addition allowing Draft mode OAuth
     }
     consent_url = f"{base_url}?{urllib.parse.urlencode(params)}"
     return redirect(consent_url)
@@ -64,7 +66,8 @@ def auth_start():
 def auth_callback():
     """
     OAuth Redirect URI -> https://auth.cohortanalysis.ai/callback
-    Amazon sends the user here after authorization. We exchange the code for a refresh token.
+    Amazon sends the user here after authorization.
+    We exchange the auth_code for a refresh_token.
     """
     spapi_secrets = get_spapi_secrets()
     lwa_client_id = spapi_secrets['CLIENT_ID']
@@ -81,7 +84,7 @@ def auth_callback():
         "grant_type": "authorization_code",
         "code": auth_code,
         "redirect_uri": "https://auth.cohortanalysis.ai/callback",
-        "client_id": lwa_client_id,
+        "client_id": lwa_client_id,       # LWA client ID
         "client_secret": lwa_client_secret
     }
 
@@ -105,8 +108,8 @@ def auth_callback():
 @app.route("/test_sp_api")
 def test_sp_api():
     """
-    Example endpoint -> https://auth.cohortanalysis.ai/test_sp_api?seller_id=XYZ
-    Uses the stored refresh token to call the SP-API for that seller.
+    Example -> http://<EC2-IP>:5000/test_sp_api?seller_id=SOMETHING
+    Uses the stored refresh token to call SP-API for that seller.
     """
     spapi_secrets = get_spapi_secrets()
     lwa_client_id = spapi_secrets['CLIENT_ID']
@@ -141,8 +144,8 @@ def test_sp_api():
         return {"error": str(exc)}, 400
 
 if __name__ == "__main__":
+    # Create the table if not exists
     create_sellers_table()
 
-    # Use an unprivileged port (5000) so we don't need sudo.
-    # Open port 5000 in your EC2 Security Group if you want external access.
+    # Listen on 0.0.0.0:5000 for external access without needing sudo
     app.run(host="0.0.0.0", port=5000, debug=True)
