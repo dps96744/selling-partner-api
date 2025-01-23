@@ -19,14 +19,14 @@ def get_spapi_secrets():
     """
     Pull SP-API LWA credentials from 'sp-api-credentials' in AWS Secrets Manager.
     {
-      "CLIENT_ID": "...",  # LWA Client ID (amzn1.application-oa2-client...)
+      "CLIENT_ID": "...",
       "CLIENT_SECRET": "...",
       "AWS_ACCESS_KEY_ID": "...",
       "AWS_SECRET_ACCESS_KEY": "..."
     }
     """
     secret_name = "sp-api-credentials"  # or your actual secret name
-    region_name = "us-east-2"          # adjust if in a different region
+    region_name = "us-east-2"          # adjust region as needed
 
     client = boto3.client('secretsmanager', region_name=region_name)
     response = client.get_secret_value(SecretId=secret_name)
@@ -37,17 +37,12 @@ def get_spapi_secrets():
 def auth_start():
     """
     1) OAuth Login URI -> https://auth.cohortanalysis.ai/start
-    2) Builds the Amazon consent URL & redirects the seller to Amazon.
-
-    - We add 'version=beta' if the app is in DRAFT mode, so Amazon uses spapi_oauth_code
-      instead of authorization_code.
+    2) Builds the Amazon consent URL (with version=beta for DRAFT) and redirects.
     """
     spapi_secrets = get_spapi_secrets()
 
-    # Your SP-API "Solution ID" (the "App ID" from Seller Central).
     spapi_solution_id = "amzn1.sp.solution.d9a2df28-9c51-40d1-84b1-89daf7c4d0a4"
-
-    redirect_uri = "https://auth.cohortanalysis.ai/callback"  # Must be HTTPS
+    redirect_uri = "https://auth.cohortanalysis.ai/callback"
     state = "randomState123"
 
     base_url = "https://sellercentral.amazon.com/apps/authorize/consent"
@@ -55,7 +50,7 @@ def auth_start():
         "application_id": spapi_solution_id,
         "redirect_uri": redirect_uri,
         "state": state,
-        "version": "beta"  # for DRAFT apps
+        "version": "beta"  # for DRAFT apps -> spapi_oauth_code
     }
     consent_url = f"{base_url}?{urllib.parse.urlencode(params)}"
     return redirect(consent_url)
@@ -63,14 +58,13 @@ def auth_start():
 @app.route("/callback")
 def auth_callback():
     """
-    1) OAuth Redirect URI -> https://auth.cohortanalysis.ai/callback
-    2) If 'version=beta', Amazon sends spapi_oauth_code => we exchange for a refresh token.
+    Draft mode callback uses spapi_oauth_code => exchange for refresh token.
     """
     spapi_secrets = get_spapi_secrets()
     lwa_client_id = spapi_secrets['CLIENT_ID']
     lwa_client_secret = spapi_secrets['CLIENT_SECRET']
 
-    auth_code = request.args.get('spapi_oauth_code')  # for draft flow
+    auth_code = request.args.get('spapi_oauth_code')
     selling_partner_id = request.args.get('selling_partner_id')
 
     if not auth_code:
@@ -97,16 +91,16 @@ def auth_callback():
     if not selling_partner_id:
         selling_partner_id = "UNKNOWN_PARTNER"
 
-    # Store refresh token in DB
     store_refresh_token(selling_partner_id, refresh_token)
 
     return f"Authorized seller {selling_partner_id}. You can close this window."
+
 
 @app.route("/test_sp_api")
 def test_sp_api():
     """
     Example -> https://auth.cohortanalysis.ai/test_sp_api?seller_id=XYZ
-    Basic SP-API call to Sellers.get_marketplace_participation()
+    Calls get_marketplace_participation for a quick test.
     """
     spapi_secrets = get_spapi_secrets()
     seller_id = request.args.get('seller_id')
@@ -117,7 +111,7 @@ def test_sp_api():
     if not token:
         return f"No refresh token found for {seller_id}", 404
 
-    credentials_dict = {
+    creds = {
         'lwa_app_id': spapi_secrets['CLIENT_ID'],
         'lwa_client_secret': spapi_secrets['CLIENT_SECRET'],
         'refresh_token': token,
@@ -125,7 +119,7 @@ def test_sp_api():
         'aws_secret_key': spapi_secrets['AWS_SECRET_ACCESS_KEY']
     }
 
-    sellers_client = Sellers(credentials=credentials_dict, marketplace=Marketplaces.US)
+    sellers_client = Sellers(credentials=creds, marketplace=Marketplaces.US)
     try:
         response = sellers_client.get_marketplace_participation()
         return {
@@ -138,8 +132,8 @@ def test_sp_api():
 @app.route("/sales")
 def get_sales():
     """
-    Example -> https://auth.cohortanalysis.ai/sales?seller_id=XYZ
-    Pulls last 7 days of orders from Orders API (may not reach beyond ~2 yrs).
+    -> https://auth.cohortanalysis.ai/sales?seller_id=XYZ
+    7-day Orders from the Orders API.
     """
     spapi_secrets = get_spapi_secrets()
     seller_id = request.args.get('seller_id')
@@ -150,7 +144,7 @@ def get_sales():
     if not token:
         return f"No refresh token found for {seller_id}", 404
 
-    credentials_dict = {
+    creds = {
         'lwa_app_id': spapi_secrets['CLIENT_ID'],
         'lwa_client_secret': spapi_secrets['CLIENT_SECRET'],
         'refresh_token': token,
@@ -158,7 +152,7 @@ def get_sales():
         'aws_secret_key': spapi_secrets['AWS_SECRET_ACCESS_KEY']
     }
 
-    orders_client = Orders(credentials=credentials_dict, marketplace=Marketplaces.US)
+    orders_client = Orders(credentials=creds, marketplace=Marketplaces.US)
     seven_days_ago = (datetime.datetime.utcnow() - datetime.timedelta(days=7)).isoformat()
 
     try:
@@ -174,29 +168,24 @@ def get_sales():
     except SellingApiException as exc:
         return jsonify({"error": str(exc)}), 400
 
+
 @app.route("/long_term_sales")
 def get_long_term_sales():
     """
-    Example -> https://auth.cohortanalysis.ai/long_term_sales?seller_id=XYZ
-
-    Demonstrates requesting older data (>2 yrs) via the Reports API (ALL_ORDERS).
-    We create a 'GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL' report for ~10 yrs,
-    then poll for completion, and finally retrieve the report doc.
-
-    In reality, this can produce huge data & take time. A real production approach
-    would do this asynchronously, storing the file or partial results somewhere
-    rather than returning them in one request.
+    -> https://auth.cohortanalysis.ai/long_term_sales?seller_id=XYZ
+    Uses Reports API (GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL)
+    to retrieve older orders. We fix the code to use .payload from the ApiResponse.
     """
     spapi_secrets = get_spapi_secrets()
     seller_id = request.args.get('seller_id')
     if not seller_id:
-        return "Missing seller_id param", 400
+        return "Missing seller_id", 400
 
     token = get_refresh_token(seller_id)
     if not token:
         return f"No refresh token found for {seller_id}", 404
 
-    credentials_dict = {
+    creds = {
         'lwa_app_id': spapi_secrets['CLIENT_ID'],
         'lwa_client_secret': spapi_secrets['CLIENT_SECRET'],
         'refresh_token': token,
@@ -204,47 +193,46 @@ def get_long_term_sales():
         'aws_secret_key': spapi_secrets['AWS_SECRET_ACCESS_KEY']
     }
 
-    reports_client = Reports(credentials=credentials_dict, marketplace=Marketplaces.US)
+    reports_client = Reports(credentials=creds, marketplace=Marketplaces.US)
 
     now_utc = datetime.datetime.utcnow().isoformat()
-    # 10 years => 3650 days
     ten_years_ago = (datetime.datetime.utcnow() - datetime.timedelta(days=3650)).isoformat()
 
     try:
-        # 1) Create the ALL_ORDERS report
-        create_resp = reports_client.create_report(
+        # 1) Create the report
+        create_report_resp = reports_client.create_report(
             reportType="GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL",
             dataStartTime=ten_years_ago,
             dataEndTime=now_utc,
             marketplaceIds=["ATVPDKIKX0DER"]
         )
-        report_id = create_resp.get("reportId")
+        # Must use .payload from the ApiResponse
+        create_payload = create_report_resp.payload
+        # 'reportId' is in create_payload
+        report_id = create_payload.get("reportId")
         if not report_id:
             return jsonify({"error": "No reportId returned"}), 400
 
-        # 2) Poll for report completion
-        #   This is a naive approach that may block for minutes if the report is large.
+        # 2) Poll for completion
         while True:
             status_resp = reports_client.get_report(reportId=report_id)
-            report_info = status_resp.payload
-            if report_info.get("processingStatus") == "DONE":
-                # 3) Once DONE, get the reportDocumentId
-                doc_id = report_info.get("reportDocumentId")
+            status_payload = status_resp.payload
+            processing_status = status_payload.get("processingStatus")
+            if processing_status == "DONE":
+                doc_id = status_payload.get("reportDocumentId")
                 if not doc_id:
                     return jsonify({"error": "No reportDocumentId returned"}), 400
                 break
-            elif report_info.get("processingStatus") in ("CANCELLED", "FATAL"):
-                return jsonify({"error": f"Report cancelled or fatal. {report_info}"}), 400
-            time.sleep(5)  # wait 5s before checking again
+            elif processing_status in ("CANCELLED", "FATAL"):
+                return jsonify({"error": f"Report cancelled/fatal. {status_payload}"}), 400
 
-        # 4) Retrieve the report document
+            time.sleep(5)  # wait 5s, naive approach
+
+        # 3) Retrieve the report document
         doc_resp = reports_client.get_report_document(doc_id)
-        # doc_resp.payload has details; doc_resp.file is the actual file content
-        # python-amazon-sp-api includes a method to decode
-        # Example: doc_resp.decode() if it's text
+        # doc_resp.payload has meta info; doc_resp.decode() gets the actual file
         content = doc_resp.decode()
 
-        # We'll just return the entire text content here (might be huge).
         return jsonify({
             "seller_id": seller_id,
             "report_id": report_id,
@@ -259,5 +247,4 @@ def get_long_term_sales():
 
 if __name__ == "__main__":
     create_sellers_table()
-    # Listen on 0.0.0.0:5000 behind Nginx+SSL => https://auth.cohortanalysis.ai
     app.run(host="0.0.0.0", port=5000, debug=True)
