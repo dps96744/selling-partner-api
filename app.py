@@ -17,15 +17,15 @@ app = Flask(__name__)
 
 def get_spapi_secrets():
     """
-    Fetches your SP-API LWA credentials from a secret named 'sp-api-credentials'.
+    Fetches SP-API LWA credentials from 'sp-api-credentials' in Secrets Manager:
     {
-      "CLIENT_ID": "...",          # LWA client ID (amzn1.application-oa2-client...)
-      "CLIENT_SECRET": "...",      # LWA client secret
+      "CLIENT_ID": "...",   # LWA client ID (amzn1.application-oa2-client...)
+      "CLIENT_SECRET": "...",
       "AWS_ACCESS_KEY_ID": "...",
       "AWS_SECRET_ACCESS_KEY": "..."
     }
     """
-    secret_name = "sp-api-credentials"
+    secret_name = "sp-api-credentials"  # or your actual secret name
     region_name = "us-east-2"
 
     client = boto3.client('secretsmanager', region_name=region_name)
@@ -36,28 +36,26 @@ def get_spapi_secrets():
 @app.route("/start")
 def auth_start():
     """
-    OAuth Login URI -> http://<EC2-IP>:5000/start
+    OAuth Login URI -> e.g. http://auth.cohortanalysis.ai/start
     Builds the Amazon consent URL & redirects the seller to Amazon.
-
-    IMPORTANT: We add 'version=beta' to support a DRAFT app workflow.
-    Once your app is published, remove "version": "beta".
+    Using 'version=beta' for a draft app. Remove 'version' once published.
     """
     spapi_secrets = get_spapi_secrets()
 
-    # This is your SP-API "Solution ID"/"App ID" from Seller Central, something like:
-    # amzn1.sp.solution.d9a2df28-9c51-40d1-84b1-89daf7c4d0a4
+    # Replace with your SP-API "Solution/App ID" (e.g., amzn1.sp.solution.d9a2df28-...).
+    # If your app is in draft mode, you do NOT want to use the LWA client ID here.
     spapi_solution_id = "amzn1.sp.solution.d9a2df28-9c51-40d1-84b1-89daf7c4d0a4"
 
-    # The redirect URI must match what's in your Developer Console.
-    redirect_uri = "https://auth.cohortanalysis.ai/callback"
+    # Now using HTTP instead of HTTPS
+    redirect_uri = "http://auth.cohortanalysis.ai/callback"
     state = "randomState123"
 
     base_url = "https://sellercentral.amazon.com/apps/authorize/consent"
     params = {
-        "application_id": spapi_solution_id,     # SP-API solution ID
+        "application_id": spapi_solution_id,
         "redirect_uri": redirect_uri,
         "state": state,
-        "version": "beta"   # <-- The key addition allowing Draft mode OAuth
+        "version": "beta"   # for draft-mode apps
     }
     consent_url = f"{base_url}?{urllib.parse.urlencode(params)}"
     return redirect(consent_url)
@@ -65,8 +63,8 @@ def auth_start():
 @app.route("/callback")
 def auth_callback():
     """
-    OAuth Redirect URI -> https://auth.cohortanalysis.ai/callback
-    Amazon sends the user here after authorization.
+    OAuth Redirect URI -> http://auth.cohortanalysis.ai/callback
+    Amazon sends user here after authorization.
     We exchange the auth_code for a refresh_token.
     """
     spapi_secrets = get_spapi_secrets()
@@ -83,8 +81,8 @@ def auth_callback():
     data = {
         "grant_type": "authorization_code",
         "code": auth_code,
-        "redirect_uri": "https://auth.cohortanalysis.ai/callback",
-        "client_id": lwa_client_id,       # LWA client ID
+        "redirect_uri": "http://auth.cohortanalysis.ai/callback",  # now HTTP
+        "client_id": lwa_client_id,         # LWA client ID
         "client_secret": lwa_client_secret
     }
 
@@ -108,8 +106,8 @@ def auth_callback():
 @app.route("/test_sp_api")
 def test_sp_api():
     """
-    Example -> http://<EC2-IP>:5000/test_sp_api?seller_id=SOMETHING
-    Uses the stored refresh token to call SP-API for that seller.
+    Example -> http://auth.cohortanalysis.ai/test_sp_api?seller_id=SOMETHING
+    Uses stored refresh token to call SP-API for that seller.
     """
     spapi_secrets = get_spapi_secrets()
     lwa_client_id = spapi_secrets['CLIENT_ID']
@@ -144,8 +142,9 @@ def test_sp_api():
         return {"error": str(exc)}, 400
 
 if __name__ == "__main__":
-    # Create the table if not exists
+    # Create the sellers table if not exists
     create_sellers_table()
 
-    # Listen on 0.0.0.0:5000 for external access without needing sudo
+    # Listen on 0.0.0.0:5000 so Nginx can proxy requests
+    # or you can open port 5000 publicly for testing without Nginx
     app.run(host="0.0.0.0", port=5000, debug=True)
