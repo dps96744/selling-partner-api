@@ -17,18 +17,19 @@ app = Flask(__name__)
 
 def get_spapi_secrets():
     """
-    Fetches SP-API LWA credentials from 'sp-api-credentials' in Secrets Manager:
+    Pull SP-API LWA credentials from Secrets Manager under 'sp-api-credentials':
     {
-      "CLIENT_ID": "...",   # LWA client ID (amzn1.application-oa2-client...)
+      "CLIENT_ID": "...",  # LWA client ID: amzn1.application-oa2-client.…
       "CLIENT_SECRET": "...",
       "AWS_ACCESS_KEY_ID": "...",
       "AWS_SECRET_ACCESS_KEY": "..."
     }
     """
-    secret_name = "sp-api-credentials"  # or your actual secret name
+    secret_name = "sp-api-credentials"
     region_name = "us-east-2"
 
-    client = boto3.client('secretsmanager', region_name=region_name)
+    session = boto3.session.Session()
+    client = session.client(service_name='secretsmanager', region_name=region_name)
     response = client.get_secret_value(SecretId=secret_name)
     secret_str = response['SecretString']
     return json.loads(secret_str)
@@ -36,18 +37,19 @@ def get_spapi_secrets():
 @app.route("/start")
 def auth_start():
     """
-    OAuth Login URI -> e.g. http://auth.cohortanalysis.ai/start
+    OAuth Login URI -> https://auth.cohortanalysis.ai/start
     Builds the Amazon consent URL & redirects the seller to Amazon.
-    Using 'version=beta' for a draft app. Remove 'version' once published.
+
+    NOTE: We'll keep 'version=beta' for a DRAFT app. Remove once published.
     """
     spapi_secrets = get_spapi_secrets()
 
-    # Replace with your SP-API "Solution/App ID" (e.g., amzn1.sp.solution.d9a2df28-...).
-    # If your app is in draft mode, you do NOT want to use the LWA client ID here.
+    # Your SP-API Solution ID (the "App ID" in Seller Central):
+    # e.g. amzn1.sp.solution.d9a2df28-9c51-40d1-84b1-89daf7c4d0a4
     spapi_solution_id = "amzn1.sp.solution.d9a2df28-9c51-40d1-84b1-89daf7c4d0a4"
 
-    # Now using HTTP instead of HTTPS
-    redirect_uri = "http://auth.cohortanalysis.ai/callback"
+    # Must be HTTPS now that Amazon requires a secured URI
+    redirect_uri = "https://auth.cohortanalysis.ai/callback"
     state = "randomState123"
 
     base_url = "https://sellercentral.amazon.com/apps/authorize/consent"
@@ -55,7 +57,7 @@ def auth_start():
         "application_id": spapi_solution_id,
         "redirect_uri": redirect_uri,
         "state": state,
-        "version": "beta"   # for draft-mode apps
+        "version": "beta"  # keep for Draft mode
     }
     consent_url = f"{base_url}?{urllib.parse.urlencode(params)}"
     return redirect(consent_url)
@@ -63,26 +65,27 @@ def auth_start():
 @app.route("/callback")
 def auth_callback():
     """
-    OAuth Redirect URI -> http://auth.cohortanalysis.ai/callback
-    Amazon sends user here after authorization.
-    We exchange the auth_code for a refresh_token.
+    OAuth Redirect URI -> https://auth.cohortanalysis.ai/callback
+    After clicking "Allow," Amazon sends the user (seller) here.
+    We exchange authorization_code for a refresh_token.
     """
     spapi_secrets = get_spapi_secrets()
-    lwa_client_id = spapi_secrets['CLIENT_ID']
+    lwa_client_id = spapi_secrets['CLIENT_ID']       # amzn1.application-oa2-client.xxxx
     lwa_client_secret = spapi_secrets['CLIENT_SECRET']
 
     auth_code = request.args.get('authorization_code')
-    selling_partner_id = request.args.get('selling_partner_id')  # sometimes included
+    selling_partner_id = request.args.get('selling_partner_id')  # optional
 
     if not auth_code:
         return "Missing authorization_code", 400
 
+    # Exchange the code for tokens
     token_url = "https://api.amazon.com/auth/o2/token"
     data = {
         "grant_type": "authorization_code",
         "code": auth_code,
-        "redirect_uri": "http://auth.cohortanalysis.ai/callback",  # now HTTP
-        "client_id": lwa_client_id,         # LWA client ID
+        "redirect_uri": "https://auth.cohortanalysis.ai/callback",  # must match exactly
+        "client_id": lwa_client_id,
         "client_secret": lwa_client_secret
     }
 
@@ -106,8 +109,8 @@ def auth_callback():
 @app.route("/test_sp_api")
 def test_sp_api():
     """
-    Example -> http://auth.cohortanalysis.ai/test_sp_api?seller_id=SOMETHING
-    Uses stored refresh token to call SP-API for that seller.
+    Example -> https://auth.cohortanalysis.ai/test_sp_api?seller_id=YOUR_SELLER_ID
+    Uses the stored refresh token to call SP-API for that seller.
     """
     spapi_secrets = get_spapi_secrets()
     lwa_client_id = spapi_secrets['CLIENT_ID']
@@ -142,9 +145,7 @@ def test_sp_api():
         return {"error": str(exc)}, 400
 
 if __name__ == "__main__":
-    # Create the sellers table if not exists
     create_sellers_table()
 
-    # Listen on 0.0.0.0:5000 so Nginx can proxy requests
-    # or you can open port 5000 publicly for testing without Nginx
+    # Listen on 0.0.0.0:5000 so Nginx can proxy to it
     app.run(host="0.0.0.0", port=5000, debug=True)
