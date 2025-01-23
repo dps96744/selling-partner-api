@@ -17,7 +17,8 @@ app = Flask(__name__)
 
 def get_spapi_secrets():
     """
-    Pull SP-API LWA credentials from 'sp-api-credentials' in AWS Secrets Manager.
+    Fetches SP-API LWA credentials from 'sp-api-credentials' in AWS Secrets Manager.
+    JSON structure:
     {
       "CLIENT_ID": "...",
       "CLIENT_SECRET": "...",
@@ -25,8 +26,8 @@ def get_spapi_secrets():
       "AWS_SECRET_ACCESS_KEY": "..."
     }
     """
-    secret_name = "sp-api-credentials"  # or your actual secret name
-    region_name = "us-east-2"          # adjust region as needed
+    secret_name = "sp-api-credentials"  # Adjust if your secret is named differently
+    region_name = "us-east-2"          # Adjust if in another region
 
     client = boto3.client('secretsmanager', region_name=region_name)
     response = client.get_secret_value(SecretId=secret_name)
@@ -36,13 +37,14 @@ def get_spapi_secrets():
 @app.route("/start")
 def auth_start():
     """
-    1) OAuth Login URI -> https://auth.cohortanalysis.ai/start
-    2) Builds the Amazon consent URL (with version=beta for DRAFT) and redirects.
+    OAuth Login URI (Draft mode => spapi_oauth_code).
+    e.g. https://auth.cohortanalysis.ai/start
     """
     spapi_secrets = get_spapi_secrets()
-
+    # Your SP-API "Solution ID" from Seller Central
     spapi_solution_id = "amzn1.sp.solution.d9a2df28-9c51-40d1-84b1-89daf7c4d0a4"
-    redirect_uri = "https://auth.cohortanalysis.ai/callback"
+
+    redirect_uri = "https://auth.cohortanalysis.ai/callback"  # Must be HTTPS
     state = "randomState123"
 
     base_url = "https://sellercentral.amazon.com/apps/authorize/consent"
@@ -50,15 +52,14 @@ def auth_start():
         "application_id": spapi_solution_id,
         "redirect_uri": redirect_uri,
         "state": state,
-        "version": "beta"  # for DRAFT apps -> spapi_oauth_code
+        "version": "beta"  # for DRAFT apps => spapi_oauth_code
     }
-    consent_url = f"{base_url}?{urllib.parse.urlencode(params)}"
-    return redirect(consent_url)
+    return redirect(f"{base_url}?{urllib.parse.urlencode(params)}")
 
 @app.route("/callback")
 def auth_callback():
     """
-    Draft mode callback uses spapi_oauth_code => exchange for refresh token.
+    Draft-mode callback => spapi_oauth_code => we exchange for refresh token.
     """
     spapi_secrets = get_spapi_secrets()
     lwa_client_id = spapi_secrets['CLIENT_ID']
@@ -91,6 +92,7 @@ def auth_callback():
     if not selling_partner_id:
         selling_partner_id = "UNKNOWN_PARTNER"
 
+    # Store refresh token in DB
     store_refresh_token(selling_partner_id, refresh_token)
 
     return f"Authorized seller {selling_partner_id}. You can close this window."
@@ -99,8 +101,8 @@ def auth_callback():
 @app.route("/test_sp_api")
 def test_sp_api():
     """
-    Example -> https://auth.cohortanalysis.ai/test_sp_api?seller_id=XYZ
-    Calls get_marketplace_participation for a quick test.
+    Quick test -> https://auth.cohortanalysis.ai/test_sp_api?seller_id=XYZ
+    Calls Sellers.get_marketplace_participation
     """
     spapi_secrets = get_spapi_secrets()
     seller_id = request.args.get('seller_id')
@@ -129,11 +131,104 @@ def test_sp_api():
     except SellingApiException as exc:
         return {"error": str(exc)}, 400
 
+
+@app.route("/long_term_sales")
+def get_long_term_sales():
+    """
+    -> https://auth.cohortanalysis.ai/long_term_sales?seller_id=XYZ
+
+    Requests the 'Archived Orders' report:
+    GET_FLAT_FILE_ARCHIVED_ORDERS_DATA_BY_ORDER_DATE
+    => Amazon might store older data here (some users see 2016+).
+
+    We poll until 'DONE', then fetch doc_resp.file & decode ourselves
+    to avoid the NoneType decode error.
+    """
+    spapi_secrets = get_spapi_secrets()
+    seller_id = request.args.get('seller_id')
+    if not seller_id:
+        return "Missing seller_id", 400
+
+    token = get_refresh_token(seller_id)
+    if not token:
+        return f"No refresh token found for {seller_id}", 404
+
+    creds = {
+        'lwa_app_id': spapi_secrets['CLIENT_ID'],
+        'lwa_client_secret': spapi_secrets['CLIENT_SECRET'],
+        'refresh_token': token,
+        'aws_access_key': spapi_secrets['AWS_ACCESS_KEY_ID'],
+        'aws_secret_key': spapi_secrets['AWS_SECRET_ACCESS_KEY']
+    }
+
+    reports_client = Reports(credentials=creds, marketplace=Marketplaces.US)
+
+    now_utc = datetime.datetime.utcnow().isoformat()
+    # Let's say we go back ~10 years => 3650 days
+    ten_years_ago = (datetime.datetime.utcnow() - datetime.timedelta(days=3650)).isoformat()
+
+    try:
+        # 1) Create the 'Archived Orders' report
+        # According to your mention, the valid report type is:
+        # GET_FLAT_FILE_ARCHIVED_ORDERS_DATA_BY_ORDER_DATE
+        create_report_resp = reports_client.create_report(
+            reportType="GET_FLAT_FILE_ARCHIVED_ORDERS_DATA_BY_ORDER_DATE",
+            dataStartTime=ten_years_ago,
+            dataEndTime=now_utc,
+            marketplaceIds=["ATVPDKIKX0DER"]  # US
+        )
+        create_payload = create_report_resp.payload or {}
+        report_id = create_payload.get("reportId")
+        if not report_id:
+            return jsonify({"error": "No reportId returned from create_report"}), 400
+
+        # 2) Poll for processingStatus
+        while True:
+            status_resp = reports_client.get_report(reportId=report_id)
+            status_payload = status_resp.payload or {}
+            processing_status = status_payload.get("processingStatus")
+            if processing_status == "DONE":
+                doc_id = status_payload.get("reportDocumentId")
+                if not doc_id:
+                    return jsonify({"error": "No reportDocumentId"}), 400
+                break
+            elif processing_status in ("CANCELLED", "FATAL"):
+                return jsonify({"error": f"Report {report_id} cancelled/fatal: {status_payload}"}), 400
+
+            time.sleep(5)  # naive approach, 5s intervals
+
+        # 3) Retrieve the report document
+        doc_resp = reports_client.get_report_document(reportDocumentId=doc_id)
+        # doc_resp is an ApiResponse. doc_resp.file is the raw data
+        # we manually decode here to avoid 'NoneType' decode errors
+        if not hasattr(doc_resp, 'file'):
+            return jsonify({"error": "doc_resp has no file attribute"}), 400
+
+        file_bytes = doc_resp.file  # typically bytes
+        if not file_bytes:
+            return jsonify({"error": "No file content returned"}), 400
+
+        # decode as text
+        content = file_bytes.decode('utf-8', errors='replace')
+
+        # Return partial preview
+        return jsonify({
+            "seller_id": seller_id,
+            "report_id": report_id,
+            "report_document_id": doc_id,
+            "file_length": len(content),
+            "report_file_preview": content[:1000]
+        })
+
+    except SellingApiException as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
 @app.route("/sales")
 def get_sales():
     """
     -> https://auth.cohortanalysis.ai/sales?seller_id=XYZ
-    7-day Orders from the Orders API.
+    7-day Orders from the Orders API
     """
     spapi_secrets = get_spapi_secrets()
     seller_id = request.args.get('seller_id')
@@ -167,83 +262,6 @@ def get_sales():
         })
     except SellingApiException as exc:
         return jsonify({"error": str(exc)}), 400
-
-
-@app.route("/long_term_sales")
-def get_long_term_sales():
-    """
-    -> https://auth.cohortanalysis.ai/long_term_sales?seller_id=XYZ
-    Uses Reports API (GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL)
-    to retrieve older orders. We fix the code to use .payload from the ApiResponse.
-    """
-    spapi_secrets = get_spapi_secrets()
-    seller_id = request.args.get('seller_id')
-    if not seller_id:
-        return "Missing seller_id", 400
-
-    token = get_refresh_token(seller_id)
-    if not token:
-        return f"No refresh token found for {seller_id}", 404
-
-    creds = {
-        'lwa_app_id': spapi_secrets['CLIENT_ID'],
-        'lwa_client_secret': spapi_secrets['CLIENT_SECRET'],
-        'refresh_token': token,
-        'aws_access_key': spapi_secrets['AWS_ACCESS_KEY_ID'],
-        'aws_secret_key': spapi_secrets['AWS_SECRET_ACCESS_KEY']
-    }
-
-    reports_client = Reports(credentials=creds, marketplace=Marketplaces.US)
-
-    now_utc = datetime.datetime.utcnow().isoformat()
-    ten_years_ago = (datetime.datetime.utcnow() - datetime.timedelta(days=3650)).isoformat()
-
-    try:
-        # 1) Create the report
-        create_report_resp = reports_client.create_report(
-            reportType="GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL",
-            dataStartTime=ten_years_ago,
-            dataEndTime=now_utc,
-            marketplaceIds=["ATVPDKIKX0DER"]
-        )
-        # Must use .payload from the ApiResponse
-        create_payload = create_report_resp.payload
-        # 'reportId' is in create_payload
-        report_id = create_payload.get("reportId")
-        if not report_id:
-            return jsonify({"error": "No reportId returned"}), 400
-
-        # 2) Poll for completion
-        while True:
-            status_resp = reports_client.get_report(reportId=report_id)
-            status_payload = status_resp.payload
-            processing_status = status_payload.get("processingStatus")
-            if processing_status == "DONE":
-                doc_id = status_payload.get("reportDocumentId")
-                if not doc_id:
-                    return jsonify({"error": "No reportDocumentId returned"}), 400
-                break
-            elif processing_status in ("CANCELLED", "FATAL"):
-                return jsonify({"error": f"Report cancelled/fatal. {status_payload}"}), 400
-
-            time.sleep(5)  # wait 5s, naive approach
-
-        # 3) Retrieve the report document
-        doc_resp = reports_client.get_report_document(doc_id)
-        # doc_resp.payload has meta info; doc_resp.decode() gets the actual file
-        content = doc_resp.decode()
-
-        return jsonify({
-            "seller_id": seller_id,
-            "report_id": report_id,
-            "report_document_id": doc_id,
-            "file_length": len(content),
-            "report_file_preview": content[:1000]  # first 1000 chars
-        })
-
-    except SellingApiException as exc:
-        return jsonify({"error": str(exc)}), 400
-
 
 if __name__ == "__main__":
     create_sellers_table()
