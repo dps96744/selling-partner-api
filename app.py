@@ -18,16 +18,16 @@ app = Flask(__name__)
 def get_spapi_secrets():
     """
     Pulls SP-API LWA credentials from 'sp-api-credentials' in AWS Secrets Manager.
-    JSON example:
+    Expected JSON structure:
     {
-      "CLIENT_ID": "...",  # LWA client ID (amzn1.application-oa2-client...)
+      "CLIENT_ID": "...",
       "CLIENT_SECRET": "...",
       "AWS_ACCESS_KEY_ID": "...",
       "AWS_SECRET_ACCESS_KEY": "..."
     }
     """
     secret_name = "sp-api-credentials"  # or your actual secret name
-    region_name = "us-east-2"          # adjust if in another region
+    region_name = "us-east-2"          # update if a different region
 
     client = boto3.client('secretsmanager', region_name=region_name)
     response = client.get_secret_value(SecretId=secret_name)
@@ -37,14 +37,13 @@ def get_spapi_secrets():
 @app.route("/start")
 def auth_start():
     """
-    OAuth Login URI (Draft mode => spapi_oauth_code).
-    e.g. https://auth.cohortanalysis.ai/start
-    We add 'version=beta' for a DRAFT app.
+    OAuth Login URI -> https://auth.cohortanalysis.ai/start
+    Because the app is in DRAFT, we use 'version=beta' => spapi_oauth_code
     """
     spapi_secrets = get_spapi_secrets()
     spapi_solution_id = "amzn1.sp.solution.d9a2df28-9c51-40d1-84b1-89daf7c4d0a4"
 
-    redirect_uri = "https://auth.cohortanalysis.ai/callback"  # Must be HTTPS
+    redirect_uri = "https://auth.cohortanalysis.ai/callback"  # must be HTTPS for Amazon
     state = "randomState123"
 
     base_url = "https://sellercentral.amazon.com/apps/authorize/consent"
@@ -52,7 +51,7 @@ def auth_start():
         "application_id": spapi_solution_id,
         "redirect_uri": redirect_uri,
         "state": state,
-        "version": "beta"  # for DRAFT apps => spapi_oauth_code
+        "version": "beta"  # DRAFT => spapi_oauth_code
     }
     consent_url = f"{base_url}?{urllib.parse.urlencode(params)}"
     return redirect(consent_url)
@@ -60,7 +59,7 @@ def auth_start():
 @app.route("/callback")
 def auth_callback():
     """
-    DRAFT callback => spapi_oauth_code => exchange for refresh token.
+    Draft-mode callback => Amazon sends spapi_oauth_code => exchange for a refresh token.
     """
     spapi_secrets = get_spapi_secrets()
     lwa_client_id = spapi_secrets['CLIENT_ID']
@@ -93,6 +92,7 @@ def auth_callback():
     if not selling_partner_id:
         selling_partner_id = "UNKNOWN_PARTNER"
 
+    # Store the refresh token in DB
     store_refresh_token(selling_partner_id, refresh_token)
 
     return f"Authorized seller {selling_partner_id}. You can close this window."
@@ -101,7 +101,7 @@ def auth_callback():
 def test_sp_api():
     """
     -> https://auth.cohortanalysis.ai/test_sp_api?seller_id=XYZ
-    Basic test: calls Sellers.get_marketplace_participation for that seller.
+    Simple check of SP-API using Sellers.get_marketplace_participation.
     """
     spapi_secrets = get_spapi_secrets()
     seller_id = request.args.get('seller_id')
@@ -134,7 +134,7 @@ def test_sp_api():
 def get_sales():
     """
     -> https://auth.cohortanalysis.ai/sales?seller_id=XYZ
-    Last 7 days of Orders from the Orders API (which typically only goes ~2 yrs).
+    Last 7 days of Orders from the Orders API.
     """
     spapi_secrets = get_spapi_secrets()
     seller_id = request.args.get('seller_id')
@@ -169,13 +169,12 @@ def get_sales():
     except SellingApiException as exc:
         return jsonify({"error": str(exc)}), 400
 
-@app.route("/long_term_sales_5yrs")
-def get_long_term_sales_5yrs():
+@app.route("/long_term_sales_2020")
+def get_long_term_sales_2020():
     """
-    -> https://auth.cohortanalysis.ai/long_term_sales_5yrs?seller_id=XYZ
-    Requests ~5 years of archived orders via GET_FLAT_FILE_ARCHIVED_ORDERS_DATA_BY_ORDER_DATE
-    to see data older than ~2 yrs. 
-    We poll every 5s until 'DONE' or 'CANCELLED/FATAL'.
+    -> https://auth.cohortanalysis.ai/long_term_sales_2020?seller_id=XYZ
+    Requests the 'Archived Orders' report specifically from 2020-01-01 to 2021-01-01
+    to test ~1 year of older data.
     """
     spapi_secrets = get_spapi_secrets()
     seller_id = request.args.get('seller_id')
@@ -196,15 +195,16 @@ def get_long_term_sales_5yrs():
 
     reports_client = Reports(credentials=creds, marketplace=Marketplaces.US)
 
-    now_utc = datetime.datetime.utcnow().isoformat()
-    five_years_ago = (datetime.datetime.utcnow() - datetime.timedelta(days=1825)).isoformat()
+    # We'll use fixed UTC datetimes for all of 2020
+    start_2020 = "2020-01-01T00:00:00Z"
+    end_2021 = "2021-01-01T00:00:00Z"
 
     try:
-        # 1) Request the 'Archived Orders' report
+        # 1) Create the 'Archived Orders' report for that 1-year window
         create_report_resp = reports_client.create_report(
             reportType="GET_FLAT_FILE_ARCHIVED_ORDERS_DATA_BY_ORDER_DATE",
-            dataStartTime=five_years_ago,
-            dataEndTime=now_utc,
+            dataStartTime=start_2020,
+            dataEndTime=end_2021,
             marketplaceIds=["ATVPDKIKX0DER"]
         )
         create_payload = create_report_resp.payload or {}
@@ -236,7 +236,7 @@ def get_long_term_sales_5yrs():
         if not file_bytes:
             return jsonify({"error": "No file content returned"}), 400
 
-        # decode the bytes
+        # decode the bytes as UTF-8
         content = file_bytes.decode('utf-8', errors='replace')
 
         return jsonify({
@@ -252,5 +252,4 @@ def get_long_term_sales_5yrs():
 
 if __name__ == "__main__":
     create_sellers_table()
-    # We run on port 5000 behind Nginx => https://auth.cohortanalysis.ai
     app.run(host="0.0.0.0", port=5000, debug=True)
