@@ -3,11 +3,11 @@
 import json
 import requests
 import urllib.parse
-from flask import Flask, request, redirect
+import datetime
+from flask import Flask, request, redirect, jsonify
 
 from db import create_sellers_table, store_refresh_token, get_refresh_token
-
-from sp_api.api import Sellers
+from sp_api.api import Sellers, Orders
 from sp_api.base import Marketplaces, SellingApiException
 
 import boto3
@@ -17,19 +17,19 @@ app = Flask(__name__)
 
 def get_spapi_secrets():
     """
-    Pull SP-API LWA credentials from 'sp-api-credentials' in Secrets Manager:
+    Pull SP-API LWA credentials from 'sp-api-credentials' in AWS Secrets Manager.
+    JSON structure:
     {
-      "CLIENT_ID": "...",  # LWA client ID: amzn1.application-oa2-client.…
+      "CLIENT_ID": "...",  # LWA Client ID (amzn1.application-oa2-client...)
       "CLIENT_SECRET": "...",
       "AWS_ACCESS_KEY_ID": "...",
       "AWS_SECRET_ACCESS_KEY": "..."
     }
     """
-    secret_name = "sp-api-credentials"
-    region_name = "us-east-2"
+    secret_name = "sp-api-credentials"  # Or your actual secret name
+    region_name = "us-east-2"          # Adjust if in a different region
 
-    session = boto3.session.Session()
-    client = session.client(service_name='secretsmanager', region_name=region_name)
+    client = boto3.client('secretsmanager', region_name=region_name)
     response = client.get_secret_value(SecretId=secret_name)
     secret_str = response['SecretString']
     return json.loads(secret_str)
@@ -37,19 +37,19 @@ def get_spapi_secrets():
 @app.route("/start")
 def auth_start():
     """
-    OAuth Login URI -> https://auth.cohortanalysis.ai/start
-    Builds the Amazon consent URL & redirects the seller to Amazon.
+    1) OAuth Login URL -> e.g. https://auth.cohortanalysis.ai/start
+    2) Builds Amazon consent URL & redirects user to Amazon.
 
-    We use 'version=beta' since the app is in DRAFT mode, and Amazon 
-    might send 'spapi_oauth_code' instead of 'authorization_code'.
+    NOTE: We add 'version=beta' if our app is DRAFT in Seller Central,
+    because Amazon's draft flow uses 'spapi_oauth_code' param. 
     """
     spapi_secrets = get_spapi_secrets()
 
-    # Your SP-API Solution ID (the "App ID" in Seller Central).
+    # Your SP-API "Solution ID" from Seller Central's Developer Console
     # e.g. amzn1.sp.solution.d9a2df28-9c51-40d1-84b1-89daf7c4d0a4
     spapi_solution_id = "amzn1.sp.solution.d9a2df28-9c51-40d1-84b1-89daf7c4d0a4"
 
-    # Must be HTTPS for Amazon
+    # Must be https for Amazon
     redirect_uri = "https://auth.cohortanalysis.ai/callback"
     state = "randomState123"
 
@@ -58,7 +58,7 @@ def auth_start():
         "application_id": spapi_solution_id,
         "redirect_uri": redirect_uri,
         "state": state,
-        "version": "beta"  # Required for Draft-mode apps
+        "version": "beta"  # required for DRAFT apps
     }
     consent_url = f"{base_url}?{urllib.parse.urlencode(params)}"
     return redirect(consent_url)
@@ -66,29 +66,25 @@ def auth_start():
 @app.route("/callback")
 def auth_callback():
     """
-    OAuth Redirect URI -> https://auth.cohortanalysis.ai/callback
-    Now Amazon sends 'spapi_oauth_code' instead of 'authorization_code'.
-
-    We exchange spapi_oauth_code for a refresh_token.
+    1) OAuth Redirect URL -> https://auth.cohortanalysis.ai/callback
+    2) Amazon sends 'spapi_oauth_code' & 'selling_partner_id' if we're in DRAFT flow.
+    3) Exchange that code for a refresh_token & store it in the DB.
     """
     spapi_secrets = get_spapi_secrets()
-    lwa_client_id = spapi_secrets['CLIENT_ID']         # amzn1.application-oa2-client...
+    lwa_client_id = spapi_secrets['CLIENT_ID']
     lwa_client_secret = spapi_secrets['CLIENT_SECRET']
 
-    # The new Draft flow param from Amazon is 'spapi_oauth_code'
+    # In draft mode, Amazon sends spapi_oauth_code, not authorization_code
     auth_code = request.args.get('spapi_oauth_code')
-    selling_partner_id = request.args.get('selling_partner_id')  # optional
+    selling_partner_id = request.args.get('selling_partner_id')
 
     if not auth_code:
         return "Missing spapi_oauth_code param", 400
 
-    # Exchange the spapi_oauth_code for tokens
     token_url = "https://api.amazon.com/auth/o2/token"
     data = {
         "grant_type": "authorization_code",
-        # The 'code' field in the token request is still the LWA param name,
-        # but we supply the spapi_oauth_code value from the callback.
-        "code": auth_code,
+        "code": auth_code,  # from spapi_oauth_code
         "redirect_uri": "https://auth.cohortanalysis.ai/callback",
         "client_id": lwa_client_id,
         "client_secret": lwa_client_secret
@@ -106,7 +102,7 @@ def auth_callback():
     if not selling_partner_id:
         selling_partner_id = "UNKNOWN_PARTNER"
 
-    # Store the refresh token in your DB
+    # Save the refresh token
     store_refresh_token(selling_partner_id, refresh_token)
 
     return f"Authorized seller {selling_partner_id}. You can close this window."
@@ -114,15 +110,11 @@ def auth_callback():
 @app.route("/test_sp_api")
 def test_sp_api():
     """
-    Example -> https://auth.cohortanalysis.ai/test_sp_api?seller_id=YOUR_SELLER_ID
-    Uses stored refresh token to call SP-API for that seller.
+    Example -> https://auth.cohortanalysis.ai/test_sp_api?seller_id=XYZ
+    A quick route showing how to call SP-API with that seller's refresh token.
+    Calls get_marketplace_participation for demonstration.
     """
     spapi_secrets = get_spapi_secrets()
-    lwa_client_id = spapi_secrets['CLIENT_ID']
-    lwa_client_secret = spapi_secrets['CLIENT_SECRET']
-    aws_access_key = spapi_secrets['AWS_ACCESS_KEY_ID']
-    aws_secret_key = spapi_secrets['AWS_SECRET_ACCESS_KEY']
-
     seller_id = request.args.get('seller_id')
     if not seller_id:
         return "Missing seller_id param", 400
@@ -132,11 +124,11 @@ def test_sp_api():
         return f"No refresh token found for {seller_id}", 404
 
     credentials_dict = {
-        'lwa_app_id': lwa_client_id,
-        'lwa_client_secret': lwa_client_secret,
+        'lwa_app_id': spapi_secrets['CLIENT_ID'],
+        'lwa_client_secret': spapi_secrets['CLIENT_SECRET'],
         'refresh_token': token,
-        'aws_access_key': aws_access_key,
-        'aws_secret_key': aws_secret_key
+        'aws_access_key': spapi_secrets['AWS_ACCESS_KEY_ID'],
+        'aws_secret_key': spapi_secrets['AWS_SECRET_ACCESS_KEY']
     }
 
     sellers_client = Sellers(credentials=credentials_dict, marketplace=Marketplaces.US)
@@ -149,7 +141,49 @@ def test_sp_api():
     except SellingApiException as exc:
         return {"error": str(exc)}, 400
 
+@app.route("/sales")
+def get_sales():
+    """
+    Example -> https://auth.cohortanalysis.ai/sales?seller_id=XYZ
+    Fetch last 7 days of orders from SP-API for that seller.
+    """
+    spapi_secrets = get_spapi_secrets()
+    seller_id = request.args.get('seller_id')
+    if not seller_id:
+        return "Missing seller_id", 400
+
+    token = get_refresh_token(seller_id)
+    if not token:
+        return f"No refresh token found for {seller_id}", 404
+
+    credentials_dict = {
+        'lwa_app_id': spapi_secrets['CLIENT_ID'],
+        'lwa_client_secret': spapi_secrets['CLIENT_SECRET'],
+        'refresh_token': token,
+        'aws_access_key': spapi_secrets['AWS_ACCESS_KEY_ID'],
+        'aws_secret_key': spapi_secrets['AWS_SECRET_ACCESS_KEY']
+    }
+
+    # Use the Orders client
+    orders_client = Orders(credentials=credentials_dict, marketplace=Marketplaces.US)
+
+    # Compute "created after" timestamp
+    seven_days_ago = (datetime.datetime.utcnow() - datetime.timedelta(days=7)).isoformat()
+
+    try:
+        response = orders_client.get_orders(
+            CreatedAfter=seven_days_ago,
+            MarketplaceIds=["ATVPDKIKX0DER"]  # US marketplace ID
+        )
+        orders_data = response.payload.get("Orders", [])
+        return jsonify({
+            "seller_id": seller_id,
+            "orders_last_7_days": orders_data
+        })
+    except SellingApiException as exc:
+        return jsonify({"error": str(exc)}), 400
+
 if __name__ == "__main__":
     create_sellers_table()
-    # Listen on 0.0.0.0:5000 behind Nginx
+    # We run on 0.0.0.0:5000; Nginx proxies HTTPS -> port 5000
     app.run(host="0.0.0.0", port=5000, debug=True)
