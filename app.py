@@ -17,8 +17,7 @@ app = Flask(__name__)
 
 def get_spapi_secrets():
     """
-    Pulls SP-API LWA credentials from 'sp-api-credentials' in AWS Secrets Manager.
-    Expected JSON structure:
+    Pull SP-API LWA credentials from 'sp-api-credentials' in AWS Secrets Manager.
     {
       "CLIENT_ID": "...",
       "CLIENT_SECRET": "...",
@@ -38,12 +37,12 @@ def get_spapi_secrets():
 def auth_start():
     """
     OAuth Login URI -> https://auth.cohortanalysis.ai/start
-    Because the app is in DRAFT, we use 'version=beta' => spapi_oauth_code
+    Because the app is in DRAFT, we add 'version=beta' => spapi_oauth_code
     """
     spapi_secrets = get_spapi_secrets()
     spapi_solution_id = "amzn1.sp.solution.d9a2df28-9c51-40d1-84b1-89daf7c4d0a4"
 
-    redirect_uri = "https://auth.cohortanalysis.ai/callback"  # must be HTTPS for Amazon
+    redirect_uri = "https://auth.cohortanalysis.ai/callback"  # must be HTTPS
     state = "randomState123"
 
     base_url = "https://sellercentral.amazon.com/apps/authorize/consent"
@@ -59,7 +58,7 @@ def auth_start():
 @app.route("/callback")
 def auth_callback():
     """
-    Draft-mode callback => Amazon sends spapi_oauth_code => exchange for a refresh token.
+    Draft callback => spapi_oauth_code => exchange for refresh token.
     """
     spapi_secrets = get_spapi_secrets()
     lwa_client_id = spapi_secrets['CLIENT_ID']
@@ -92,7 +91,7 @@ def auth_callback():
     if not selling_partner_id:
         selling_partner_id = "UNKNOWN_PARTNER"
 
-    # Store the refresh token in DB
+    # Save refresh token in DB
     store_refresh_token(selling_partner_id, refresh_token)
 
     return f"Authorized seller {selling_partner_id}. You can close this window."
@@ -101,7 +100,7 @@ def auth_callback():
 def test_sp_api():
     """
     -> https://auth.cohortanalysis.ai/test_sp_api?seller_id=XYZ
-    Simple check of SP-API using Sellers.get_marketplace_participation.
+    Example: calls Sellers.get_marketplace_participation
     """
     spapi_secrets = get_spapi_secrets()
     seller_id = request.args.get('seller_id')
@@ -169,12 +168,14 @@ def get_sales():
     except SellingApiException as exc:
         return jsonify({"error": str(exc)}), 400
 
-@app.route("/long_term_sales_2020")
-def get_long_term_sales_2020():
+@app.route("/fba_shipment_q1_2020")
+def fba_shipment_q1_2020():
     """
-    -> https://auth.cohortanalysis.ai/long_term_sales_2020?seller_id=XYZ
-    Requests the 'Archived Orders' report specifically from 2020-01-01 to 2021-01-01
-    to test ~1 year of older data.
+    -> https://auth.cohortanalysis.ai/fba_shipment_q1_2020?seller_id=XYZ
+
+    Requests the 'GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL' report
+    for Q1 2020: Jan 1, 2020 -> Apr 1, 2020.
+    This can show older FBA shipments if Amazon retains them.
     """
     spapi_secrets = get_spapi_secrets()
     seller_id = request.args.get('seller_id')
@@ -195,16 +196,16 @@ def get_long_term_sales_2020():
 
     reports_client = Reports(credentials=creds, marketplace=Marketplaces.US)
 
-    # We'll use fixed UTC datetimes for all of 2020
-    start_2020 = "2020-01-01T00:00:00Z"
-    end_2021 = "2021-01-01T00:00:00Z"
+    # Q1 2020 => Jan 1 to Apr 1, 2020 (UTC datetimes)
+    start_q1_2020 = "2020-01-01T00:00:00Z"
+    end_q1_2020 = "2020-04-01T00:00:00Z"
 
     try:
-        # 1) Create the 'Archived Orders' report for that 1-year window
+        # 1) Create the 'Amazon Fulfilled Shipments' report
         create_report_resp = reports_client.create_report(
-            reportType="GET_FLAT_FILE_ARCHIVED_ORDERS_DATA_BY_ORDER_DATE",
-            dataStartTime=start_2020,
-            dataEndTime=end_2021,
+            reportType="GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL",
+            dataStartTime=start_q1_2020,
+            dataEndTime=end_q1_2020,
             marketplaceIds=["ATVPDKIKX0DER"]
         )
         create_payload = create_report_resp.payload or {}
@@ -220,10 +221,10 @@ def get_long_term_sales_2020():
             if processing_status == "DONE":
                 doc_id = status_payload.get("reportDocumentId")
                 if not doc_id:
-                    return jsonify({"error": "No reportDocumentId returned"}), 400
+                    return jsonify({"error": "No reportDocumentId"}), 400
                 break
             elif processing_status in ("CANCELLED", "FATAL"):
-                return jsonify({"error": f"Report {report_id} canceled/fatal: {status_payload}"}), 400
+                return jsonify({"error": f"Report {report_id} cancelled/fatal: {status_payload}"}), 400
 
             time.sleep(5)  # poll every 5s
 
@@ -236,7 +237,7 @@ def get_long_term_sales_2020():
         if not file_bytes:
             return jsonify({"error": "No file content returned"}), 400
 
-        # decode the bytes as UTF-8
+        # decode
         content = file_bytes.decode('utf-8', errors='replace')
 
         return jsonify({
@@ -252,4 +253,5 @@ def get_long_term_sales_2020():
 
 if __name__ == "__main__":
     create_sellers_table()
+    # Listen on 0.0.0.0:5000 => behind Nginx => https://auth.cohortanalysis.ai
     app.run(host="0.0.0.0", port=5000, debug=True)
