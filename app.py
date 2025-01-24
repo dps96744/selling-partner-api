@@ -17,8 +17,7 @@ app = Flask(__name__)
 
 def get_spapi_secrets():
     """
-    Pull SP-API LWA credentials from 'sp-api-credentials' in AWS Secrets Manager.
-    JSON structure:
+    Fetches SP-API LWA credentials from 'sp-api-credentials' in AWS Secrets Manager.
     {
       "CLIENT_ID": "...",
       "CLIENT_SECRET": "...",
@@ -26,8 +25,8 @@ def get_spapi_secrets():
       "AWS_SECRET_ACCESS_KEY": "..."
     }
     """
-    secret_name = "sp-api-credentials"
-    region_name = "us-east-2"
+    secret_name = "sp-api-credentials"  # or your actual secret name
+    region_name = "us-east-2"          # update if using another region
 
     client = boto3.client('secretsmanager', region_name=region_name)
     response = client.get_secret_value(SecretId=secret_name)
@@ -38,7 +37,7 @@ def get_spapi_secrets():
 def auth_start():
     """
     OAuth Login URI -> https://auth.cohortanalysis.ai/start
-    DRAFT => 'version=beta' => spapi_oauth_code
+    Because app is in DRAFT, we use 'version=beta' => spapi_oauth_code
     """
     spapi_secrets = get_spapi_secrets()
     spapi_solution_id = "amzn1.sp.solution.d9a2df28-9c51-40d1-84b1-89daf7c4d0a4"
@@ -51,7 +50,7 @@ def auth_start():
         "application_id": spapi_solution_id,
         "redirect_uri": redirect_uri,
         "state": state,
-        "version": "beta"  # draft => spapi_oauth_code
+        "version": "beta"  # DRAFT => spapi_oauth_code
     }
     consent_url = f"{base_url}?{urllib.parse.urlencode(params)}"
     return redirect(consent_url)
@@ -59,7 +58,7 @@ def auth_start():
 @app.route("/callback")
 def auth_callback():
     """
-    Draft flow => spapi_oauth_code => exchange for refresh token
+    DRAFT -> spapi_oauth_code => exchange for refresh token
     """
     spapi_secrets = get_spapi_secrets()
     lwa_client_id = spapi_secrets['CLIENT_ID']
@@ -100,12 +99,12 @@ def auth_callback():
 def test_sp_api():
     """
     -> https://auth.cohortanalysis.ai/test_sp_api?seller_id=XYZ
-    Simple check: Sellers.get_marketplace_participation
+    Quick test: calls Sellers.get_marketplace_participation
     """
     spapi_secrets = get_spapi_secrets()
     seller_id = request.args.get('seller_id')
     if not seller_id:
-        return "Missing seller_id param", 400
+        return "Missing seller_id", 400
 
     token = get_refresh_token(seller_id)
     if not token:
@@ -133,7 +132,7 @@ def test_sp_api():
 def get_sales():
     """
     -> https://auth.cohortanalysis.ai/sales?seller_id=XYZ
-    Last 7 days from Orders API
+    7-day Orders from Orders API
     """
     spapi_secrets = get_spapi_secrets()
     seller_id = request.args.get('seller_id')
@@ -168,19 +167,18 @@ def get_sales():
     except SellingApiException as exc:
         return jsonify({"error": str(exc)}), 400
 
-@app.route("/orders_2022")
-def orders_2022():
+@app.route("/fba_shipments_2022")
+def fba_shipments_2022():
     """
-    -> https://auth.cohortanalysis.ai/orders_2022?seller_id=XYZ
+    -> https://auth.cohortanalysis.ai/fba_shipments_2022?seller_id=XYZ
 
-    Requests GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL for 2022 (1 year).
-    This might be more likely to succeed than older years, but no guarantee—Amazon
-    can still CANCEL if it doesn't store data or the seller account doesn't qualify.
+    Requests GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL for 2022-01-01 -> 2023-01-01.
+    This is for FBA shipments in 2022, if Amazon retains them in this report.
     """
     spapi_secrets = get_spapi_secrets()
     seller_id = request.args.get('seller_id')
     if not seller_id:
-        return "Missing seller_id param", 400
+        return "Missing seller_id", 400
 
     token = get_refresh_token(seller_id)
     if not token:
@@ -196,14 +194,14 @@ def orders_2022():
 
     reports_client = Reports(credentials=creds, marketplace=Marketplaces.US)
 
-    # 2022 => Jan 1, 2022 -> Jan 1, 2023
+    # Full year 2022 => Jan 1, 2022 to Jan 1, 2023
     start_2022 = "2022-01-01T00:00:00Z"
     end_2023 = "2023-01-01T00:00:00Z"
 
     try:
-        # 1) Create the All Orders by Date General report
+        # 1) Create the FBA shipments report
         create_report_resp = reports_client.create_report(
-            reportType="GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL",
+            reportType="GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL",
             dataStartTime=start_2022,
             dataEndTime=end_2023,
             marketplaceIds=["ATVPDKIKX0DER"]
@@ -213,7 +211,7 @@ def orders_2022():
         if not report_id:
             return jsonify({"error": "No reportId returned"}), 400
 
-        # 2) Poll until DONE or CANCELLED/FATAL
+        # 2) Poll for completion
         while True:
             status_resp = reports_client.get_report(reportId=report_id)
             status_payload = status_resp.payload or {}
@@ -228,7 +226,7 @@ def orders_2022():
 
             time.sleep(5)
 
-        # 3) Retrieve the doc
+        # 3) Retrieve the report doc
         doc_resp = reports_client.get_report_document(reportDocumentId=doc_id)
         if not hasattr(doc_resp, 'file'):
             return jsonify({"error": "doc_resp has no file attribute"}), 400
