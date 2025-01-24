@@ -18,6 +18,7 @@ app = Flask(__name__)
 def get_spapi_secrets():
     """
     Pull SP-API LWA credentials from 'sp-api-credentials' in AWS Secrets Manager.
+    JSON structure:
     {
       "CLIENT_ID": "...",
       "CLIENT_SECRET": "...",
@@ -25,8 +26,8 @@ def get_spapi_secrets():
       "AWS_SECRET_ACCESS_KEY": "..."
     }
     """
-    secret_name = "sp-api-credentials"  # or your actual secret name
-    region_name = "us-east-2"          # update if a different region
+    secret_name = "sp-api-credentials"
+    region_name = "us-east-2"
 
     client = boto3.client('secretsmanager', region_name=region_name)
     response = client.get_secret_value(SecretId=secret_name)
@@ -37,12 +38,12 @@ def get_spapi_secrets():
 def auth_start():
     """
     OAuth Login URI -> https://auth.cohortanalysis.ai/start
-    Because the app is in DRAFT, we add 'version=beta' => spapi_oauth_code
+    DRAFT => 'version=beta' => spapi_oauth_code
     """
     spapi_secrets = get_spapi_secrets()
     spapi_solution_id = "amzn1.sp.solution.d9a2df28-9c51-40d1-84b1-89daf7c4d0a4"
 
-    redirect_uri = "https://auth.cohortanalysis.ai/callback"  # must be HTTPS
+    redirect_uri = "https://auth.cohortanalysis.ai/callback"
     state = "randomState123"
 
     base_url = "https://sellercentral.amazon.com/apps/authorize/consent"
@@ -50,7 +51,7 @@ def auth_start():
         "application_id": spapi_solution_id,
         "redirect_uri": redirect_uri,
         "state": state,
-        "version": "beta"  # DRAFT => spapi_oauth_code
+        "version": "beta"  # draft => spapi_oauth_code
     }
     consent_url = f"{base_url}?{urllib.parse.urlencode(params)}"
     return redirect(consent_url)
@@ -58,7 +59,7 @@ def auth_start():
 @app.route("/callback")
 def auth_callback():
     """
-    Draft callback => spapi_oauth_code => exchange for refresh token.
+    Draft flow => spapi_oauth_code => exchange for refresh token
     """
     spapi_secrets = get_spapi_secrets()
     lwa_client_id = spapi_secrets['CLIENT_ID']
@@ -91,7 +92,6 @@ def auth_callback():
     if not selling_partner_id:
         selling_partner_id = "UNKNOWN_PARTNER"
 
-    # Save refresh token in DB
     store_refresh_token(selling_partner_id, refresh_token)
 
     return f"Authorized seller {selling_partner_id}. You can close this window."
@@ -100,7 +100,7 @@ def auth_callback():
 def test_sp_api():
     """
     -> https://auth.cohortanalysis.ai/test_sp_api?seller_id=XYZ
-    Example: calls Sellers.get_marketplace_participation
+    Simple check: Sellers.get_marketplace_participation
     """
     spapi_secrets = get_spapi_secrets()
     seller_id = request.args.get('seller_id')
@@ -133,7 +133,7 @@ def test_sp_api():
 def get_sales():
     """
     -> https://auth.cohortanalysis.ai/sales?seller_id=XYZ
-    Last 7 days of Orders from the Orders API.
+    Last 7 days from Orders API
     """
     spapi_secrets = get_spapi_secrets()
     seller_id = request.args.get('seller_id')
@@ -168,19 +168,19 @@ def get_sales():
     except SellingApiException as exc:
         return jsonify({"error": str(exc)}), 400
 
-@app.route("/fba_shipment_q1_2020")
-def fba_shipment_q1_2020():
+@app.route("/orders_2022")
+def orders_2022():
     """
-    -> https://auth.cohortanalysis.ai/fba_shipment_q1_2020?seller_id=XYZ
+    -> https://auth.cohortanalysis.ai/orders_2022?seller_id=XYZ
 
-    Requests the 'GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL' report
-    for Q1 2020: Jan 1, 2020 -> Apr 1, 2020.
-    This can show older FBA shipments if Amazon retains them.
+    Requests GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL for 2022 (1 year).
+    This might be more likely to succeed than older years, but no guarantee—Amazon
+    can still CANCEL if it doesn't store data or the seller account doesn't qualify.
     """
     spapi_secrets = get_spapi_secrets()
     seller_id = request.args.get('seller_id')
     if not seller_id:
-        return "Missing seller_id", 400
+        return "Missing seller_id param", 400
 
     token = get_refresh_token(seller_id)
     if not token:
@@ -196,16 +196,16 @@ def fba_shipment_q1_2020():
 
     reports_client = Reports(credentials=creds, marketplace=Marketplaces.US)
 
-    # Q1 2020 => Jan 1 to Apr 1, 2020 (UTC datetimes)
-    start_q1_2020 = "2020-01-01T00:00:00Z"
-    end_q1_2020 = "2020-04-01T00:00:00Z"
+    # 2022 => Jan 1, 2022 -> Jan 1, 2023
+    start_2022 = "2022-01-01T00:00:00Z"
+    end_2023 = "2023-01-01T00:00:00Z"
 
     try:
-        # 1) Create the 'Amazon Fulfilled Shipments' report
+        # 1) Create the All Orders by Date General report
         create_report_resp = reports_client.create_report(
-            reportType="GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL",
-            dataStartTime=start_q1_2020,
-            dataEndTime=end_q1_2020,
+            reportType="GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL",
+            dataStartTime=start_2022,
+            dataEndTime=end_2023,
             marketplaceIds=["ATVPDKIKX0DER"]
         )
         create_payload = create_report_resp.payload or {}
@@ -213,7 +213,7 @@ def fba_shipment_q1_2020():
         if not report_id:
             return jsonify({"error": "No reportId returned"}), 400
 
-        # 2) Poll for completion
+        # 2) Poll until DONE or CANCELLED/FATAL
         while True:
             status_resp = reports_client.get_report(reportId=report_id)
             status_payload = status_resp.payload or {}
@@ -221,14 +221,14 @@ def fba_shipment_q1_2020():
             if processing_status == "DONE":
                 doc_id = status_payload.get("reportDocumentId")
                 if not doc_id:
-                    return jsonify({"error": "No reportDocumentId"}), 400
+                    return jsonify({"error": "No reportDocumentId returned"}), 400
                 break
             elif processing_status in ("CANCELLED", "FATAL"):
-                return jsonify({"error": f"Report {report_id} cancelled/fatal: {status_payload}"}), 400
+                return jsonify({"error": f"Report {report_id} canceled/fatal: {status_payload}"}), 400
 
-            time.sleep(5)  # poll every 5s
+            time.sleep(5)
 
-        # 3) Retrieve the report doc
+        # 3) Retrieve the doc
         doc_resp = reports_client.get_report_document(reportDocumentId=doc_id)
         if not hasattr(doc_resp, 'file'):
             return jsonify({"error": "doc_resp has no file attribute"}), 400
@@ -237,9 +237,7 @@ def fba_shipment_q1_2020():
         if not file_bytes:
             return jsonify({"error": "No file content returned"}), 400
 
-        # decode
         content = file_bytes.decode('utf-8', errors='replace')
-
         return jsonify({
             "seller_id": seller_id,
             "report_id": report_id,
@@ -253,5 +251,4 @@ def fba_shipment_q1_2020():
 
 if __name__ == "__main__":
     create_sellers_table()
-    # Listen on 0.0.0.0:5000 => behind Nginx => https://auth.cohortanalysis.ai
     app.run(host="0.0.0.0", port=5000, debug=True)
