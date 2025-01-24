@@ -25,10 +25,9 @@ def get_db_secret():
       "dbname": "postgres"
     }
     """
-    secret_name = "MyRDSSecret"   # <-- Updated per your request
-    region_name = "us-east-2"     # Ensure this is correct for your secret's region
+    secret_name = "MyRDSSecret"  # Your secret name
+    region_name = "us-east-2"    # Update if your secret is in another region
 
-    # Create a Secrets Manager client
     session = boto3.session.Session()
     client = session.client(service_name='secretsmanager', region_name=region_name)
 
@@ -48,10 +47,9 @@ def get_db_secret():
 def get_connection():
     """
     Builds a psycopg2 connection using credentials from Secrets Manager.
-    Uses sslmode='require' to ensure encryption to RDS if needed.
+    Uses sslmode='require' for RDS encryption if needed.
     """
     secret = get_db_secret()
-    # Expecting keys: "username", "password", "host", "port", "dbname"
     db_user = secret["username"]
     db_pass = secret["password"]
     db_host = secret["host"]
@@ -65,7 +63,7 @@ def get_connection():
             host=db_host,
             port=db_port,
             dbname=db_name,
-            sslmode='require'  # ensures an encrypted connection if required by RDS
+            sslmode='require'
         )
         return conn
     except psycopg2.OperationalError as e:
@@ -117,9 +115,10 @@ def create_ads_tokens_table():
 # SP-API: Store & Fetch
 #####################################
 
-def store_seller_refresh_token(selling_partner_id, refresh_token):
+def store_refresh_token(selling_partner_id, refresh_token):
     """
-    Insert or update the SP-API refresh token for a given seller (selling_partner_id).
+    Inserts or updates the SP-API refresh token for a given seller (selling_partner_id).
+    (Matches your usage in app.py)
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -135,9 +134,10 @@ def store_seller_refresh_token(selling_partner_id, refresh_token):
     cur.close()
     conn.close()
 
-def fetch_seller_refresh_token(selling_partner_id):
+def get_refresh_token(selling_partner_id):
     """
-    Return the SP-API refresh token for a seller, or None if not found.
+    Returns the SP-API refresh token for the given seller, or None if not found.
+    (Matches your usage in app.py)
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -156,7 +156,7 @@ def fetch_seller_refresh_token(selling_partner_id):
 
 def store_ads_refresh_token(advertiser_id, refresh_token):
     """
-    Insert or update the Amazon Ads refresh token for a given advertiser_id.
+    Inserts or updates the Amazon Ads refresh token for a given advertiser_id.
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -174,7 +174,7 @@ def store_ads_refresh_token(advertiser_id, refresh_token):
 
 def fetch_ads_refresh_token(advertiser_id):
     """
-    Return the Amazon Ads refresh token for a given advertiser, or None if not found.
+    Returns the Amazon Ads refresh token for the given advertiser, or None if not found.
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -188,7 +188,7 @@ def fetch_ads_refresh_token(advertiser_id):
     return None
 
 #####################################
-# Main: Create Both Tables
+# Main Entry Point
 #####################################
 
 if __name__ == "__main__":
