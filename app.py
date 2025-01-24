@@ -5,6 +5,7 @@ import requests
 import urllib.parse
 import datetime
 import time
+import csv  # Added for CSV parsing
 from flask import Flask, request, redirect, jsonify
 
 from db import create_sellers_table, store_refresh_token, get_refresh_token
@@ -246,6 +247,46 @@ def fba_shipments_2022():
 
     except SellingApiException as exc:
         return jsonify({"error": str(exc)}), 400
+
+
+###################################################################
+# BEGIN ADDITION: CSV-based net sales with minimal root route
+###################################################################
+
+def compute_net_sales(csv_file_path):
+    """
+    Reads a CSV and sums (Item Price - Item Promo Discount) across all rows.
+    Expects columns: 'Item Price' and 'Item Promo Discount'.
+    """
+    total = 0.0
+    with open(csv_file_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            item_price = float(row.get("Item Price", "0") or 0)
+            discount   = float(row.get("Item Promo Discount", "0") or 0)
+            total += (item_price - discount)
+    return total
+
+@app.route("/net_sales")
+def net_sales():
+    """
+    CSV-based endpoint returning total net sales.
+    Example CSV: 'test_data.csv' in the same directory.
+    """
+    csv_path = "./test_data.csv"
+    total_sales = compute_net_sales(csv_path)
+    return jsonify({"total_net_sales": total_sales})
+
+@app.route("/")
+def index():
+    """
+    Simple root route to avoid 404 at '/'
+    """
+    return "Hello from the root route! Try /net_sales to see CSV-based net sales."
+
+###################################################################
+# END ADDITION
+###################################################################
 
 if __name__ == "__main__":
     create_sellers_table()
